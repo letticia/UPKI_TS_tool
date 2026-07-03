@@ -1,0 +1,13 @@
+# amano-ts.sh 設定ファイルのひな形
+#
+# このファイルを ~/.amano-ts/config にコピーし、契約時に通知された
+# 「タイムスタンプ利用情報」の URL を記入してください。
+#
+#   mkdir -p ~/.amano-ts
+#   cp config.example ~/.amano-ts/config
+#   chmod 600 ~/.amano-ts/config
+#
+# ※ TSA の URL は契約者向けの情報です。公開リポジトリにコミットしないでください。
+
+# TSA エンドポイント URL(stamp に必須)
+TSA_URL=""
