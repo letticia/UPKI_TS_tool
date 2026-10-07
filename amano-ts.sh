@@ -268,8 +268,20 @@ check_ocsp() { # check_ocsp <署名者証明書PEM>
         report SKIP "失効確認(OCSP)" "証明書に OCSP URL の記載なし"
         return 0
     fi
-    out="$("$OSSL" ocsp -issuer "$CERTS_DIR/tsa-intermediate.pem" -cert "$signer" \
-            -url "$url" -CAfile "$CERTS_DIR/tsa-root.pem" 2>&1)" || true
+    # 送受信は curl(HTTP/1.1)で行い、openssl ocsp は要求の作成と応答の検証だけに使う。
+    # openssl ocsp -url は HTTP/1.0 で送るため 426 で拒否する経路があり、また
+    # http:// の宛先にも HTTPS_PROXY を使ってしまう(CONNECT 専用プロキシでは 405)。
+    # レスポンダは事前生成の応答を返すため nonce は付けない。
+    "$OSSL" ocsp -issuer "$CERTS_DIR/tsa-intermediate.pem" -cert "$signer" \
+        -no_nonce -reqout "$WORK/ocsp_req.der" >/dev/null 2>&1 || true
+    out=""
+    if [ -s "$WORK/ocsp_req.der" ] \
+      && curl -fsS --http1.1 --max-time 30 -H "Content-Type: application/ocsp-request" \
+            --data-binary @"$WORK/ocsp_req.der" "$url" -o "$WORK/ocsp_resp.der" 2>/dev/null; then
+        out="$("$OSSL" ocsp -respin "$WORK/ocsp_resp.der" \
+                -issuer "$CERTS_DIR/tsa-intermediate.pem" -cert "$signer" \
+                -CAfile "$CERTS_DIR/tsa-root.pem" 2>&1)" || true
+    fi
     if printf '%s' "$out" | grep -q ": revoked"; then
         report NG "失効確認(OCSP)" "証明書は失効しています(タイムスタンプを信頼してはならない)"
     elif printf '%s' "$out" | grep -q "Response verify OK" \
