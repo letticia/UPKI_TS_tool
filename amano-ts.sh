@@ -298,6 +298,62 @@ check_ocsp() { # check_ocsp <署名者証明書PEM>
     fi
 }
 
+# TSTInfo 照合(RFC 3161 §2.4.2): version、tsa フィールドと署名者証明書の対応、
+# TSQ がある場合は要求とのハッシュアルゴリズム・messageImprint・ポリシーの対応を確かめる。
+# tsa は X509_NAME_oneline 形式どうし(ts -text の DirName: と x509 -nameopt compat)で比較する。
+check_tstinfo() { # check_tstinfo <署名者証明書PEM> <応答テキスト> [TSQファイル]
+    local signer="$1" reply_txt="$2" tsq="${3:-}" ok v tsa subj
+    local q_txt qalg ralg qimp rimp qpol rpol
+    v="$(awk -F': ' '/^Version:/ { print $2; exit }' "$reply_txt")"
+    if [ "$v" != "1" ]; then
+        report NG "TSTInfo 照合" "version が 1 ではありません(${v:-不明})"
+        return 0
+    fi
+    ok="version 1"
+
+    tsa="$(sed -n 's/^TSA: //p' "$reply_txt" | head -1)"
+    case "$tsa" in
+        ""|unspecified) : ;;
+        DirName:*)
+            subj="$("$OSSL" x509 -in "$signer" -noout -subject -nameopt compat 2>/dev/null \
+                    | sed 's/^subject= *//')"
+            if [ "${tsa#DirName:}" != "$subj" ]; then
+                report NG "TSTInfo 照合" "tsa フィールドが署名者証明書の subject と一致しません"
+                return 0
+            fi
+            ok="$ok/TSA 名一致" ;;
+        *)
+            report WARN "TSTInfo 照合" "tsa フィールドの形式(${tsa%%:*})は照合に未対応です"
+            return 0 ;;
+    esac
+
+    if [ -n "$tsq" ] && [ -f "$tsq" ]; then
+        q_txt="$("$OSSL" ts -query -in "$tsq" -text 2>/dev/null)"
+        qalg="$(printf '%s\n' "$q_txt" | awk -F': ' '/^Hash Algorithm:/ { print $2; exit }')"
+        ralg="$(awk -F': ' '/^Hash Algorithm:/ { print $2; exit }' "$reply_txt")"
+        if [ -z "$qalg" ] || [ "$qalg" != "$ralg" ]; then
+            report NG "TSTInfo 照合" "ハッシュアルゴリズムが要求(${qalg:-不明})と応答(${ralg:-不明})で異なります"
+            return 0
+        fi
+        qimp="$("$OSSL" asn1parse -inform DER -in "$tsq" 2>/dev/null \
+                | awk '/OCTET STRING/ { sub(/.*HEX DUMP\]:/, ""); print; exit }' | upper)"
+        rimp="$("$OSSL" asn1parse -inform DER -in "$WORK/tstinfo.der" 2>/dev/null \
+                | awk '/OCTET STRING/ { sub(/.*HEX DUMP\]:/, ""); print; exit }' | upper)"
+        if [ -z "$qimp" ] || [ "$qimp" != "$rimp" ]; then
+            report NG "TSTInfo 照合" "messageImprint が要求と一致しません"
+            return 0
+        fi
+        qpol="$(printf '%s\n' "$q_txt" | awk -F': ' '/^Policy OID:/ { print $2; exit }')"
+        rpol="$(awk -F': ' '/^Policy OID:/ { print $2; exit }' "$reply_txt")"
+        if [ -n "$qpol" ] && [ "$qpol" != "unspecified" ] && [ "$qpol" != "$rpol" ]; then
+            report NG "TSTInfo 照合" "ポリシーが要求($qpol)と応答($rpol)で異なります"
+            return 0
+        fi
+        ok="$ok/要求と一致($ralg)"
+    fi
+    report OK "TSTInfo 照合" "$ok"
+}
+
 do_verify() { # do_verify <原本ファイル> <TSRファイル> [TSQファイル]
     local file="$1" tsr="$2" tsq="${3:-}"
     local reply_txt="$WORK/reply.txt" cms_err ncert alg imprint calc
@@ -349,6 +405,9 @@ do_verify() { # do_verify <原本ファイル> <TSRファイル> [TSQファイ�
     # --- (3) ESS 署名者証明書ID照合 ---
     # 署名者証明書は同梱順に依存せず、CMS 検証で実際に使われたものを用いる
     check_ess "$WORK/signer.pem"
+
+    # --- (3') TSTInfo 照合(version / tsa / 要求との対応) ---
+    check_tstinfo "$WORK/signer.pem" "$reply_txt" "$tsq"
 
     # --- (4) OCSP 失効確認 ---
     check_ocsp "$WORK/signer.pem"
