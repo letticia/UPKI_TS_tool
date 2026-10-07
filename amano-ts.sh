@@ -203,52 +203,61 @@ cert_hash() { # cert_hash <ハッシュアルゴリズム> <証明書PEM>(DER �
 }
 
 # signingCertificate(V1)/signingCertificateV2 属性に列挙された証明書IDを
-# 出現順に「<V1|V2> <ハッシュアルゴリズム> <ハッシュ値>」の形式で出力する。
-# V1 は SHA-1 固定、V2 は hashAlgorithm 省略時 SHA-256(RFC 5035)。
+# 出現順に「<V1|V2> <ハッシュアルゴリズム> <ハッシュ値> <属性内の順番>」の形式で
+# 出力する。V1 と V2 が併記されている場合は属性ごとに順番を1から数える。
+# V1 は SHA-1 固定。V2 は certHash の直前・1段深い位置の OID を hashAlgorithm
+# とし、省略時は SHA-256(RFC 5035)。
 extract_ess_ids() { # extract_ess_ids <トークン(DER)>
     "$OSSL" asn1parse -inform DER -in "$1" 2>/dev/null | awk '
         { match($0, /d=[0-9]+/); d = substr($0, RSTART+2, RLENGTH-2) + 0 }
-        /:id-smime-aa-signingCertificateV2/ { on=2; dep=d; alg="sha256"; next }
-        /:id-smime-aa-signingCertificate$/  { on=1; dep=d; alg="sha1"; next }
+        /:id-smime-aa-signingCertificateV2/ { on=2; dep=d; k=0; obj=""; next }
+        /:id-smime-aa-signingCertificate$/  { on=1; dep=d; k=0; obj=""; next }
         on && d <= dep && /prim: *OBJECT/   { on=0 }
-        on && /prim: *OBJECT *:(sha1|sha224|sha256|sha384|sha512) *$/ {
-            sub(/.*:/, ""); sub(/ *$/, ""); alg=$0; next
+        on && /prim: *OBJECT/ {
+            obj=$0; sub(/.*OBJECT *:/, "", obj); sub(/ *$/, "", obj); objd=d; next
         }
         on && /OCTET STRING/ && /HEX DUMP/  {
             sub(/.*HEX DUMP\]:/, "")
-            print (on==1 ? "V1" : "V2"), alg, toupper($0)
             alg = (on==1 ? "sha1" : "sha256")
+            if (on==2 && obj != "" && objd == d + 1) alg = obj
+            print (on==1 ? "V1" : "V2"), alg, toupper($0), ++k
+            obj=""
         }
     '
 }
 
-valid_ess_alg() { case "$1" in sha1|sha224|sha256|sha384|sha512) return 0 ;; esac; return 1; }
+valid_ess_alg() {
+    case "$1" in sha1|sha224|sha256|sha384|sha512|sha3-224|sha3-256|sha3-384|sha3-512) return 0 ;; esac
+    return 1
+}
 
-# ESS 照合(署名者証明書のみ): RFC 3161 §2.4.1 / RFC 5035 により、
-# signingCertificate の1件目は署名検証に使った証明書でなければならない。
+# ESS 照合(署名者証明書のみ): RFC 2634 §5.4 / RFC 5035 により、
+# signingCertificate(V2) の1件目は署名検証に使った証明書でなければならない。
+# V1 と V2 が併記されていれば両方の1件目を照合する。
 # 2件目以降(中間CA等)は本サービスでは公開証明書と一致しないため照合しない。
 check_ess() { # check_ess <署名者証明書PEM>
-    local signer="$1" kind alg hash calc n
+    local signer="$1" kind alg hash k ok="" rest=0
     extract_ess_ids "$WORK/token.p7s" > "$WORK/essids.txt"
     if [ ! -s "$WORK/essids.txt" ]; then
         report NG "ESS 署名者証明書ID照合" "signingCertificate 属性がありません(RFC 3161 の必須属性)"
         return 0
     fi
-    read -r kind alg hash < "$WORK/essids.txt"
-    if ! valid_ess_alg "$alg"; then
-        report NG "ESS 署名者証明書ID照合" "未対応のハッシュアルゴリズム: $alg"
-        return 0
-    fi
-    calc="$(cert_hash "$alg" "$signer")"
-    n="$(wc -l < "$WORK/essids.txt" | tr -d ' ')"
-    if [ "$hash" = "$calc" ]; then
-        if [ "$n" -gt 1 ]; then
-            report OK "ESS 署名者証明書ID照合" "$kind/$alg 一致(2件目以降の $((n - 1)) 件は照合対象外)"
-        else
-            report OK "ESS 署名者証明書ID照合" "$kind/$alg 一致"
+    while read -r kind alg hash k; do
+        if [ "$k" -ne 1 ]; then rest=$((rest + 1)); continue; fi
+        if ! valid_ess_alg "$alg"; then
+            report NG "ESS 署名者証明書ID照合" "$kind: 未対応のハッシュアルゴリズム: $alg"
+            return 0
         fi
+        if [ "$(cert_hash "$alg" "$signer")" != "$hash" ]; then
+            report NG "ESS 署名者証明書ID照合" "$kind: 署名者証明書が signingCertificate の1件目と一致しません(証明書差し替えの疑い)"
+            return 0
+        fi
+        ok="${ok:+$ok, }$kind/$alg"
+    done < "$WORK/essids.txt"
+    if [ "$rest" -gt 0 ]; then
+        report OK "ESS 署名者証明書ID照合" "$ok 一致(2件目以降の $rest 件は照合対象外)"
     else
-        report NG "ESS 署名者証明書ID照合" "署名者証明書が signingCertificate の1件目と一致しません(証明書差し替えの疑い)"
+        report OK "ESS 署名者証明書ID照合" "$ok 一致"
     fi
 }
 
@@ -393,7 +402,7 @@ cmd_verify() {
 # diag: ESSCertID 診断(ts -verify が失敗する原因の特定)
 # ---------------------------------------------------------------------------
 cmd_diag() {
-    local tsr="${1:-}" ncert i f found subj kind alg hash idx=0 mismatch=0 signer_ng=0
+    local tsr="${1:-}" ncert i f found subj kind alg hash idx mismatch=0 signer_ng=0
     [ -n "$tsr" ] || die "使い方: amano-ts.sh diag <file>.tsr"
     [ -f "$tsr" ] || die "ファイルが見つかりません: $tsr"
     require_tools
@@ -418,8 +427,7 @@ cmd_diag() {
 
     info "=== ESSCertID 診断: $tsr ==="
     info "signingCertificate 属性に列挙された証明書ID:"
-    while read -r kind alg hash; do
-        idx=$((idx + 1))
+    while read -r kind alg hash idx; do
         if ! valid_ess_alg "$alg"; then
             mismatch=$((mismatch + 1))
             [ "$idx" -eq 1 ] && signer_ng=1
@@ -428,8 +436,12 @@ cmd_diag() {
             continue
         fi
         if [ "$idx" -eq 1 ]; then
-            # 1件目: 署名者証明書と一致しなければならない(RFC 3161 §2.4.1)
-            if [ -f "$WORK/signer.pem" ] && [ "$(cert_hash "$alg" "$WORK/signer.pem")" = "$hash" ]; then
+            # 各属性の1件目: 署名者証明書と一致しなければならない(RFC 2634 §5.4 / RFC 5035)
+            if [ ! -f "$WORK/signer.pem" ]; then
+                mismatch=$((mismatch + 1)); signer_ng=1
+                info "  [不明]   $kind/$alg $hash"
+                info "           → トークンの署名を検証できず、署名者証明書を特定できません"
+            elif [ "$(cert_hash "$alg" "$WORK/signer.pem")" = "$hash" ]; then
                 subj="$("$OSSL" x509 -in "$WORK/signer.pem" -noout -subject | sed 's/^subject=//')"
                 info "  [一致]   $kind/$alg $hash"
                 info "           → 署名者証明書 ($subj)"
@@ -475,7 +487,10 @@ cmd_diag() {
     done < "$WORK/essids.txt"
 
     echo
-    if [ "$signer_ng" -eq 1 ]; then
+    if [ "$signer_ng" -eq 1 ] && [ ! -f "$WORK/signer.pem" ]; then
+        info "トークンの署名を検証できません(破損または改ざんの可能性)。本ツールの verify でも"
+        info "検証失敗となります。"
+    elif [ "$signer_ng" -eq 1 ]; then
         info "署名者証明書のIDが一致しません。RFC 3161 の必須要件を満たさないトークンであり、"
         info "本ツールの verify でも検証失敗となります。"
     elif [ "$mismatch" -gt 0 ]; then
