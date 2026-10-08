@@ -262,7 +262,7 @@ check_ess() { # check_ess <署名者証明書PEM>
 }
 
 check_ocsp() { # check_ocsp <署名者証明書PEM>
-    local signer="$1" url out
+    local signer="$1" url out status resp_err
     url="$("$OSSL" x509 -in "$signer" -noout -ocsp_uri 2>/dev/null)" || url=""
     if [ -z "$url" ]; then
         report SKIP "失効確認(OCSP)" "証明書に OCSP URL の記載なし"
@@ -274,27 +274,49 @@ check_ocsp() { # check_ocsp <署名者証明書PEM>
     # レスポンダは事前生成の応答を返すため nonce は付けない。
     "$OSSL" ocsp -issuer "$CERTS_DIR/tsa-intermediate.pem" -cert "$signer" \
         -no_nonce -reqout "$WORK/ocsp_req.der" >/dev/null 2>&1 || true
-    out=""
-    if [ -s "$WORK/ocsp_req.der" ] \
-      && curl -fsS --http1.1 --max-time 30 -H "Content-Type: application/ocsp-request" \
+    if ! [ -s "$WORK/ocsp_req.der" ] \
+      || ! curl -fsS --http1.1 --max-time 30 -H "Content-Type: application/ocsp-request" \
             --data-binary @"$WORK/ocsp_req.der" "$url" -o "$WORK/ocsp_resp.der" 2>/dev/null; then
-        out="$("$OSSL" ocsp -respin "$WORK/ocsp_resp.der" \
-                -issuer "$CERTS_DIR/tsa-intermediate.pem" -cert "$signer" \
-                -CAfile "$CERTS_DIR/tsa-root.pem" 2>&1)" || true
+        ocsp_unconfirmed "レスポンダに到達できず" "ネットワークを確認"
+        return 0
     fi
-    if printf '%s' "$out" | grep -q ": revoked"; then
+    # -validity_period 0: 既定では nextUpdate を 5 分過ぎた応答まで有効とみなすため、
+    # 許容幅を 0 にして期限切れの応答を検出する。
+    # 状態は「<証明書>: good」の形で出力されるが、有効期間外のときは
+    # 「<証明書>: WARNING: Status times invalid.」の後に状態だけの行が続く。
+    out="$("$OSSL" ocsp -respin "$WORK/ocsp_resp.der" \
+            -issuer "$CERTS_DIR/tsa-intermediate.pem" -cert "$signer" \
+            -CAfile "$CERTS_DIR/tsa-root.pem" -validity_period 0 2>&1)" || true
+    status="$(printf '%s\n' "$out" \
+        | sed -n -E 's/^(.*: )?(good|revoked|unknown)$/\2/p' | tail -1)"
+
+    if [ "$status" = "revoked" ]; then
+        # 失効は取り消されないため、応答の有効期間外でも失敗とする
         report NG "失効確認(OCSP)" "証明書は失効しています(タイムスタンプを信頼してはならない)"
-    elif printf '%s' "$out" | grep -q "Response verify OK" \
-      && printf '%s' "$out" | grep -q ": good"; then
-        report OK "失効確認(OCSP)" "good(応答署名も検証済み)"
-    elif printf '%s' "$out" | grep -q ": good"; then
-        report WARN "失効確認(OCSP)" "状態は good だが応答署名を検証できず"
-    else
-        if [ "$STRICT" -eq 1 ]; then
-            report NG "失効確認(OCSP)" "レスポンダに到達できず(--strict 指定のため失敗扱い)"
+    elif [ -z "$status" ]; then
+        resp_err="$(printf '%s\n' "$out" | sed -n 's/^Responder Error: //p' | head -1)"
+        if [ -n "$resp_err" ]; then
+            ocsp_unconfirmed "レスポンダがエラーを返しました: $resp_err"
         else
-            report WARN "失効確認(OCSP)" "レスポンダに到達できず(ネットワークを確認)"
+            ocsp_unconfirmed "応答を解釈できず"
         fi
+    elif ! printf '%s\n' "$out" | grep -q "^Response verify OK"; then
+        ocsp_unconfirmed "状態は $status だが応答署名を検証できず"
+    elif printf '%s\n' "$out" | grep -q "Status times invalid"; then
+        ocsp_unconfirmed "応答の有効期間外(期限切れ等)" "端末の時計も確認"
+    elif [ "$status" = "unknown" ]; then
+        ocsp_unconfirmed "レスポンダは状態を unknown と回答(証明書を把握していない)"
+    else
+        report OK "失効確認(OCSP)" "good(応答署名も検証済み)"
+    fi
+}
+
+# 失効状態を確認できなかった場合: 通常は WARN、--strict では NG
+ocsp_unconfirmed() { # ocsp_unconfirmed <理由> [通常時の補足]
+    if [ "$STRICT" -eq 1 ]; then
+        report NG "失効確認(OCSP)" "$1(--strict 指定のため失敗扱い)"
+    else
+        report WARN "失効確認(OCSP)" "$1${2:+($2)}"
     fi
 }
 
@@ -599,7 +621,7 @@ amano-ts.sh v$VERSION — アマノタイムスタンプ 取得・検証ツー�
 
 オプション:
   --certs-dir DIR   証明書の保存先(既定: ~/.amano-ts)
-  --strict          OCSP に到達できない場合を失敗扱いにする
+  --strict          OCSP で失効状態を確認できない場合を失敗扱いにする
   --force           stamp で既存の .tsr を上書きする
 
 設定ファイル:
