@@ -666,7 +666,7 @@ cmd_diag() {
         info "本ツールの verify でも検証失敗となります。"
     elif [ "$mismatch" -gt 0 ]; then
         info "不一致の証明書IDが $mismatch 件あります。これが openssl ts -verify が"
-        info "「ess cert id not found」で失敗する原因です(OpenSSL 3.x は列挙された"
+        info "「ess cert id not found」で失敗する原因です(OpenSSL 3.x 以降は列挙された"
         info "全IDが検証に使う証明書チェーン内に見つかることを要求します)。"
         info "2件目以降は RFC 2634 §5.4 上の認可証明書の ID で、署名の検証には必須ではありません。"
         info "署名者証明書のIDは一致しているため、本ツールの verify で検証できます。"

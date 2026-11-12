@@ -3,13 +3,13 @@
 アマノ株式会社のタイムスタンプサービス(e-timing)からタイムスタンプを取得し、検証するためのコマンドラインツールです。
 UPKI電子証明書発行サービスでの利用を想定しています。
 
-OpenSSL 3.x の標準検証コマンド(`openssl ts -verify`)は、本サービスのトークンに対して「ESS証明書ID不一致(`ess cert id not found`)」で失敗します。本ツールはこれを CMS 署名検証と検証済みデータからの直接照合の組み合わせで回避し、あわせて失効確認(OCSP)や nonce 照合まで一括で行います。
+OpenSSL 3.x の標準検証コマンド(`openssl ts -verify`)は、本サービスのトークンに対して(4.x でも同様に)「ESS証明書ID不一致(`ess cert id not found`)」で失敗します。本ツールはこれを CMS 署名検証と検証済みデータからの直接照合の組み合わせで回避し、あわせて失効確認(OCSP)や nonce 照合まで一括で行います。
 
 ## 動作環境
 
 macOS または Linux。以下が必要です。
 
-- **OpenSSL 3.x 以降** — macOS 標準の `/usr/bin/openssl` は LibreSSL のため使えません。`brew install openssl@3` で導入してください(ツールが自動検出します)。OpenSSL 3.0〜3.6 で動作を確認しています。使われる OpenSSL は `./amano-ts.sh --version` と、verify・diag の出力の先頭に表示されます。
+- **OpenSSL 3.x 以降** — macOS 標準の `/usr/bin/openssl` は LibreSSL のため使えません。`brew install openssl@3` で導入してください(ツールが自動検出します)。OpenSSL 3.0〜3.6・4.1 で動作を確認しています。使われる OpenSSL は `./amano-ts.sh --version` と、verify・diag の出力の先頭に表示されます。
 - **curl** — 通常はプリインストールされています。
 
 ## 導入
