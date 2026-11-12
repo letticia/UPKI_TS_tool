@@ -11,7 +11,7 @@
 #
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # ---------------------------------------------------------------------------
 # 設定(環境変数で上書き可能)
@@ -95,29 +95,53 @@ require_tsa_url() {
 }
 
 # ---------------------------------------------------------------------------
-# OpenSSL 3.x の検出(macOS 標準の LibreSSL は不可)
+# OpenSSL 3.x 以降の検出(macOS 標準の LibreSSL は不可)
 # ---------------------------------------------------------------------------
 OSSL=""
+OSSL_VERSION=""
+
+# openssl_major <openssl のパス>: OpenSSL なら主バージョン番号を echo、
+# 実行できない・OpenSSL でない(LibreSSL 等)場合は失敗を返す
+openssl_major() {
+    local v
+    v="$("$1" version 2>/dev/null)" || return 1
+    case "$v" in
+        OpenSSL\ [0-9]*) printf '%s\n' "$v" | sed -E 's/^OpenSSL ([0-9]+)\..*/\1/' ;;
+        *) return 1 ;;
+    esac
+}
+
 find_openssl() {
-    local cand v
-    for cand in "${OPENSSL_BIN:-}" \
-                openssl \
-                /opt/homebrew/opt/openssl@3/bin/openssl \
-                /usr/local/opt/openssl@3/bin/openssl \
-                /opt/homebrew/bin/openssl \
-                /usr/local/bin/openssl; do
-        [ -n "$cand" ] || continue
-        command -v "$cand" >/dev/null 2>&1 || continue
-        v="$("$cand" version 2>/dev/null)" || continue
-        case "$v" in
-            OpenSSL\ 3.*) OSSL="$cand"; return 0 ;;
-        esac
-    done
-    return 1
+    local cand major
+    # OPENSSL_BIN の明示指定は、使えなければ他を探さずにエラーとする
+    # (指定と異なる OpenSSL で黙って実行しないため)
+    if [ -n "${OPENSSL_BIN:-}" ]; then
+        command -v "$OPENSSL_BIN" >/dev/null 2>&1 \
+            || die "OPENSSL_BIN に指定された OpenSSL が見つかりません: $OPENSSL_BIN"
+        major="$(openssl_major "$OPENSSL_BIN")" \
+            || die "OPENSSL_BIN に指定されたコマンドは OpenSSL ではありません: $OPENSSL_BIN
+       ($("$OPENSSL_BIN" version 2>/dev/null || echo 'バージョンを取得できません'))"
+        [ "$major" -ge 3 ] \
+            || die "OPENSSL_BIN に指定された OpenSSL は 3.x 以降ではありません: $OPENSSL_BIN
+       ($("$OPENSSL_BIN" version 2>/dev/null))"
+        OSSL="$OPENSSL_BIN"
+    else
+        for cand in openssl \
+                    /opt/homebrew/opt/openssl@3/bin/openssl \
+                    /usr/local/opt/openssl@3/bin/openssl \
+                    /opt/homebrew/bin/openssl \
+                    /usr/local/bin/openssl; do
+            command -v "$cand" >/dev/null 2>&1 || continue
+            major="$(openssl_major "$cand")" || continue
+            if [ "$major" -ge 3 ]; then OSSL="$cand"; break; fi
+        done
+        [ -n "$OSSL" ] || return 1
+    fi
+    OSSL_VERSION="$("$OSSL" version 2>/dev/null)"
 }
 
 require_tools() {
-    find_openssl || die "OpenSSL 3.x が見つかりません。macOS では 'brew install openssl@3' で導入し、
+    find_openssl || die "OpenSSL 3.x 以降が見つかりません。macOS では 'brew install openssl@3' で導入し、
        必要なら環境変数 OPENSSL_BIN でパスを指定してください。
        (/usr/bin/openssl は LibreSSL のため使用できません)"
     command -v curl >/dev/null 2>&1 || die "curl が見つかりません。"
@@ -431,6 +455,7 @@ do_verify() { # do_verify <原本ファイル> <TSRファイル> [TSQファイ�
     NG=0; WARNED=0
 
     info "=== タイムスタンプ検証: $file / $tsr ==="
+    info "    (使用: $OSSL — $OSSL_VERSION)"
 
     # --- (1) 応答ステータス ---
     if ! "$OSSL" ts -reply -in "$tsr" -text > "$reply_txt" 2>/dev/null; then
@@ -459,7 +484,7 @@ do_verify() { # do_verify <原本ファイル> <TSRファイル> [TSQファイ�
     # --- (2) CMS 署名・証明書パス検証 ---
     # 注: OpenSSL 3.0〜3.4 では -certfile がチェーン構築に使われないため、
     # フィンガープリント照合済みのルートCA+中間CAを連結して -CAfile に渡す
-    # (全 OpenSSL 3.x で動作する方式)。
+    # (OpenSSL 3.x 以降のどのバージョンでも動作する方式)。
     cat "$CERTS_DIR/tsa-root.pem" "$CERTS_DIR/tsa-intermediate.pem" > "$WORK/trust.pem"
     if cms_err="$("$OSSL" cms -verify -inform DER -in "$WORK/token.p7s" \
             -CAfile "$WORK/trust.pem" \
@@ -569,6 +594,7 @@ cmd_diag() {
     fi
 
     info "=== ESSCertID 診断: $tsr ==="
+    info "    (使用: $OSSL — $OSSL_VERSION)"
     info "signingCertificate 属性に列挙された証明書ID:"
     while read -r kind alg hash idx; do
         if ! valid_ess_alg "$alg"; then
@@ -688,6 +714,18 @@ amano-ts.sh v$VERSION — アマノタイムスタンプ 取得・検証ツー�
 EOF
 }
 
+show_version() {
+    echo "amano-ts.sh v$VERSION"
+    # OPENSSL_BIN が不正な場合のエラー表示を含め、検出結果を表示する
+    if ( find_openssl ) >/dev/null 2>&1; then
+        find_openssl
+        echo "OpenSSL: $OSSL ($OSSL_VERSION)"
+    else
+        ( find_openssl ) 2>&1 | sed 's/^/  /' || true
+        echo "OpenSSL: 3.x 以降が見つかりません"
+    fi
+}
+
 main() {
     local args cmd
     args=""
@@ -701,7 +739,7 @@ main() {
             --policy)    [ $# -ge 2 ] && [ -n "$2" ] || die "--policy には OID または any を指定してください"
                          CLI_POLICY="$2"; shift 2 ;;
             -h|--help|help) usage; exit 0 ;;
-            -V|--version|version) echo "amano-ts.sh v$VERSION"; exit 0 ;;
+            -V|--version|version) show_version; exit 0 ;;
             -*)          die "不明なオプション: $1(help で使い方を表示)" ;;
             *)  if [ -z "$cmd" ]; then cmd="$1"; else args="$args
 $1"; fi; shift ;;

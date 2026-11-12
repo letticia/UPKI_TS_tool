@@ -9,7 +9,7 @@ OpenSSL 3.x の標準検証コマンド(`openssl ts -verify`)は、本サービ�
 
 macOS または Linux。以下が必要です。
 
-- **OpenSSL 3.x** — macOS 標準の `/usr/bin/openssl` は LibreSSL のため使えません。`brew install openssl@3` で導入してください(ツールが自動検出します)。
+- **OpenSSL 3.x 以降** — macOS 標準の `/usr/bin/openssl` は LibreSSL のため使えません。`brew install openssl@3` で導入してください(ツールが自動検出します)。OpenSSL 3.0〜3.6 で動作を確認しています。使われる OpenSSL は `./amano-ts.sh --version` と、verify・diag の出力の先頭に表示されます。
 - **curl** — 通常はプリインストールされています。
 
 ## 導入
@@ -115,7 +115,7 @@ ESS 照合は「署名に使われた証明書が発行時に宣言されたも�
 
 | 環境変数 | 説明 |
 |---|---|
-| `OPENSSL_BIN` | 使用する OpenSSL のパスを明示指定 |
+| `OPENSSL_BIN` | 使用する OpenSSL のパスを明示指定(使えない場合はエラーで停止し、他の OpenSSL は探さない) |
 | `AMANO_TS_URL` | TSA エンドポイント URL(設定ファイル `~/.amano-ts/config` より優先) |
 | `AMANO_TS_INTER_URL` / `AMANO_TS_ROOT_URL` | 証明書のダウンロード元 |
 | `AMANO_TS_INTER_FP` / `AMANO_TS_ROOT_FP` | 期待する SHA-256 フィンガープリント |
@@ -129,7 +129,9 @@ ESS 照合は「署名に使われた証明書が発行時に宣言されたも�
 
 **「TSA の URL が設定されていません」** — `stamp` には契約者向けの「タイムスタンプ利用情報」の URL が必要です。「TSA の URL の設定」の手順で `~/.amano-ts/config` を作成してください。
 
-**「OpenSSL 3.x が見つかりません」** — macOS では `brew install openssl@3`。導入済みなのに検出されない場合は `OPENSSL_BIN=/opt/homebrew/opt/openssl@3/bin/openssl ./amano-ts.sh ...` のようにパスを明示してください。
+**「OpenSSL 3.x 以降が見つかりません」** — macOS では `brew install openssl@3`。導入済みなのに検出されない場合は `OPENSSL_BIN=/opt/homebrew/opt/openssl@3/bin/openssl ./amano-ts.sh ...` のようにパスを明示してください。
+
+**「OPENSSL_BIN に指定された…」** — `OPENSSL_BIN` を指定した場合は、そのコマンドだけを使います。見つからない・OpenSSL でない(LibreSSL 等)・3.x より古い場合は、他の OpenSSL を探さずにエラーで停止します。
 
 **「フィンガープリントが一致しません」** — まず通信環境(社内プロキシ等)を確認。CA 証明書の世代交代の場合は、リポジトリ(中間CA: repo1.secomtrust.net/spcpp/ts/、ルートCA: repository.secomtrust.net/SC-Root3/)の公表値を確認し、`AMANO_TS_INTER_FP` 等で新しい値を指定して setup を再実行してください。
 
