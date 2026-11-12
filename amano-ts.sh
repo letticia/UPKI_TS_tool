@@ -11,7 +11,7 @@
 #
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # ---------------------------------------------------------------------------
 # 設定(環境変数で上書き可能)
@@ -31,6 +31,14 @@ ROOT_FP="${AMANO_TS_ROOT_FP:-24A55C2AB051442D0617766541239A4AD032D7C55175AA34FFD
 
 CERTS_DIR="${AMANO_TS_HOME:-$HOME/.amano-ts}"
 HASH_ALG="${AMANO_TS_HASH:-sha256}"
+
+# 期待する TSTInfo ポリシー OID。既定はアマノタイムスタンプサービス3161 運用規程の
+# サービスポリシー「Type-T2」。"any" で照合しない。優先順位は
+# --policy > 環境変数 AMANO_TS_POLICY > 設定ファイルの EXPECT_POLICY= > 既定値。
+DEFAULT_POLICY="0.2.440.200192.100.200.103"
+EXPECT_POLICY="$DEFAULT_POLICY"
+CLI_POLICY=""
+
 STRICT=0
 FORCE=0
 
@@ -69,11 +77,14 @@ upper() { tr 'a-f' 'A-F'; }
 # ---------------------------------------------------------------------------
 load_config() {
     local cfg="$CERTS_DIR/config"
-    [ -f "$cfg" ] || return 0
-    # shellcheck disable=SC1090
-    . "$cfg"
-    # 環境変数の指定を設定ファイルより優先する
+    if [ -f "$cfg" ]; then
+        # shellcheck disable=SC1090
+        . "$cfg"
+    fi
+    # 環境変数の指定を設定ファイルより優先し、コマンドラインをさらに優先する
     TSA_URL="${AMANO_TS_URL:-$TSA_URL}"
+    EXPECT_POLICY="${AMANO_TS_POLICY:-${EXPECT_POLICY:-$DEFAULT_POLICY}}"
+    if [ -n "$CLI_POLICY" ]; then EXPECT_POLICY="$CLI_POLICY"; fi
 }
 
 require_tsa_url() {
@@ -157,7 +168,7 @@ ensure_certs() {
 # stamp: タイムスタンプの取得(取得後に自動検証)
 # ---------------------------------------------------------------------------
 cmd_stamp() {
-    local file="${1:-}" tsq tsr http_err
+    local file="${1:-}" tsq tsr http_err new_tsq="$WORK/new.tsq" new_tsr="$WORK/new.tsr"
     [ -n "$file" ] || die "対象ファイルを指定してください: amano-ts.sh stamp <file>"
     [ -f "$file" ] || die "ファイルが見つかりません: $file"
     require_tools
@@ -169,19 +180,35 @@ cmd_stamp() {
         die "$tsr が既に存在します。上書きする場合は --force を付けてください。"
     fi
 
+    # 要求・応答はいったん作業ディレクトリに置き、Granted の応答を受け取れた
+    # 場合だけ保存先に移す。失敗時に既存の .tsr/.tsq の組を壊さないため。
     info "タイムスタンプ要求(TSQ)を作成しています..."
-    "$OSSL" ts -query -data "$file" "-$HASH_ALG" -cert -out "$tsq" 2>/dev/null
+    "$OSSL" ts -query -data "$file" "-$HASH_ALG" -cert -out "$new_tsq" 2>/dev/null \
+        || die "タイムスタンプ要求を作成できません(ハッシュアルゴリズム: $HASH_ALG)"
 
     info "TSAに送信しています: $TSA_URL"
     if ! http_err="$(curl -fsS -H "Content-Type: application/timestamp-query" \
-            --data-binary @"$tsq" "$TSA_URL" -o "$tsr" 2>&1)"; then
-        rm -f "$tsr"
+            --data-binary @"$new_tsq" "$TSA_URL" -o "$new_tsr" 2>&1)"; then
         die "TSAへの接続に失敗しました: $http_err"
     fi
 
+    # 拒否応答(badAlg・unacceptedPolicy 等)にはトークンが無いため、検証に進まず
+    # 状態と理由を表示して終了する
+    if ! "$OSSL" ts -reply -in "$new_tsr" -text > "$WORK/stamp_reply.txt" 2>/dev/null; then
+        die "TSA の応答をタイムスタンプ応答として解釈できません(URL・プロキシ設定を確認してください)"
+    fi
+    if ! grep -q "Status: Granted" "$WORK/stamp_reply.txt"; then
+        info "TSA が要求を拒否しました。タイムスタンプは保存していません。"
+        grep -E '^(Status|Status description|Failure info):' "$WORK/stamp_reply.txt" \
+            | sed 's/^/  /'
+        exit 1
+    fi
+
+    mv -f "$new_tsq" "$tsq"
+    mv -f "$new_tsr" "$tsr"
     info "タイムスタンプ応答を $tsr に保存しました。続けて検証します。"
     echo
-    do_verify "$file" "$tsr" "$tsq"
+    do_verify "$file" "$tsr" "$tsq" || exit 1
 }
 
 # ---------------------------------------------------------------------------
@@ -234,7 +261,10 @@ valid_ess_alg() {
 # ESS 照合(署名者証明書のみ): RFC 2634 §5.4 / RFC 5035 により、
 # signingCertificate(V2) の1件目は署名検証に使った証明書でなければならない。
 # V1 と V2 が併記されていれば両方の1件目を照合する。
-# 2件目以降(中間CA等)は本サービスでは公開証明書と一致しないため照合しない。
+# 2件目以降は RFC 2634 §5.4 上の認可証明書の ID で、検証に必須ではない。
+# 本サービスの2件目はアマノ株式会社の内部処理で使う時刻監査情報の識別子で、
+# 対応する証明書は非公開・トークン非同梱(アマノ株式会社の回答、2026年11月)。
+# 検証者側では照合できず、検証時の確認も不要とされているため照合しない。
 check_ess() { # check_ess <署名者証明書PEM>
     local signer="$1" kind alg hash k ok="" rest=0
     extract_ess_ids "$WORK/token.p7s" > "$WORK/essids.txt"
@@ -373,6 +403,19 @@ check_tstinfo() { # check_tstinfo <署名者証明書PEM> <応答テキスト> [
         fi
         ok="$ok/要求と一致($ralg)"
     fi
+
+    # ポリシーの期待値照合(契約しているサービスのトークンであることの確認)
+    rpol="$(awk -F': ' '/^Policy OID:/ { print $2; exit }' "$reply_txt")"
+    case "$EXPECT_POLICY" in
+        any|"")
+            ok="$ok/ポリシー ${rpol:-不明}(照合なし)" ;;
+        *)
+            if [ "$rpol" != "$EXPECT_POLICY" ]; then
+                report NG "TSTInfo 照合" "ポリシー(${rpol:-不明})が期待値($EXPECT_POLICY)と異なります"
+                return 0
+            fi
+            ok="$ok/ポリシー一致($rpol)" ;;
+    esac
     report OK "TSTInfo 照合" "$ok"
 }
 
@@ -396,11 +439,17 @@ do_verify() { # do_verify <原本ファイル> <TSRファイル> [TSQファイ�
     if grep -q "Status: Granted" "$reply_txt"; then
         report OK "応答ステータス" "Granted"
     else
+        # 拒否応答にはトークンが無いため、以降の検証は行えない
         report NG "応答ステータス" "$(grep "Status:" "$reply_txt" | head -1 | sed 's/^ *//')"
+        grep -E '^(Status description|Failure info):' "$reply_txt" | sed 's/^/         /'
+        echo; info "判定: 検証失敗(タイムスタンプが発行されていない応答です)"; return 1
     fi
 
     # --- トークンと証明書の抽出 ---
-    "$OSSL" ts -reply -in "$tsr" -token_out -out "$WORK/token.p7s" 2>/dev/null
+    if ! "$OSSL" ts -reply -in "$tsr" -token_out -out "$WORK/token.p7s" 2>/dev/null; then
+        report NG "トークンの抽出" "応答からタイムスタンプトークンを取り出せません"
+        echo; info "判定: 検証失敗"; return 1
+    fi
     ncert="$(split_embedded_certs)"
     if [ "$ncert" -lt 1 ]; then
         report NG "署名者証明書の抽出" "トークンに証明書が含まれていません(-cert なしの応答?)"
@@ -479,7 +528,8 @@ do_verify() { # do_verify <原本ファイル> <TSRファイル> [TSQファイ�
     else
         info "判定: 検証成功"
     fi
-    info "(注: ESS の2件目以降(中間CA等)の照合は実施していません。詳細は README の「検証範囲」参照)"
+    info "(注: ESS の2件目以降(本サービスでは非公開の時刻監査情報の識別子)は照合していません。"
+    info "      詳細は README の「検証範囲」参照)"
     return 0
 }
 
@@ -576,6 +626,8 @@ cmd_diag() {
             info "             公開版とは別の版(旧版・再発行版など)の証明書を指している可能性があります"
         else
             info "           → 手元のどの証明書とも一致しません"
+            info "             (本サービスでは、2件目はアマノ株式会社の内部処理で使う時刻監査情報の"
+            info "              識別子で、対応する証明書は非公開。検証時の確認は不要とされています)"
         fi
     done < "$WORK/essids.txt"
 
@@ -590,6 +642,7 @@ cmd_diag() {
         info "不一致の証明書IDが $mismatch 件あります。これが openssl ts -verify が"
         info "「ess cert id not found」で失敗する原因です(OpenSSL 3.x は列挙された"
         info "全IDが検証に使う証明書チェーン内に見つかることを要求します)。"
+        info "2件目以降は RFC 2634 §5.4 上の認可証明書の ID で、署名の検証には必須ではありません。"
         info "署名者証明書のIDは一致しているため、本ツールの verify で検証できます。"
     else
         info "全ての証明書IDが手元の証明書と一致しています。ts -verify が失敗する場合は別の原因です。"
@@ -623,6 +676,8 @@ amano-ts.sh v$VERSION — アマノタイムスタンプ 取得・検証ツー�
   --certs-dir DIR   証明書の保存先(既定: ~/.amano-ts)
   --strict          OCSP で失効状態を確認できない場合を失敗扱いにする
   --force           stamp で既存の .tsr を上書きする
+  --policy OID      期待する TSTInfo ポリシー OID(既定: $DEFAULT_POLICY
+                    = Type-T2)。any で照合しない
 
 設定ファイル:
   stamp には TSA の URL(契約時に通知される「タイムスタンプ利用情報」)が
@@ -643,6 +698,8 @@ main() {
                          CERTS_DIR="$2"; shift 2 ;;
             --strict)    STRICT=1; shift ;;
             --force)     FORCE=1; shift ;;
+            --policy)    [ $# -ge 2 ] && [ -n "$2" ] || die "--policy には OID または any を指定してください"
+                         CLI_POLICY="$2"; shift 2 ;;
             -h|--help|help) usage; exit 0 ;;
             -V|--version|version) echo "amano-ts.sh v$VERSION"; exit 0 ;;
             -*)          die "不明なオプション: $1(help で使い方を表示)" ;;
